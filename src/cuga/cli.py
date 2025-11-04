@@ -8,6 +8,7 @@ import sys
 import threading
 import platform
 import psutil
+import httpx
 from typing import List, Optional
 from loguru import logger
 from cuga.config import settings, PACKAGE_ROOT, get_user_data_path, TRAJECTORY_DATA_DIR
@@ -33,6 +34,7 @@ _playwright_started: bool = False
 
 def kill_processes_by_port(ports: List[int]):
     """Kill processes listening on specified ports."""
+    killed_any = False
     for port in ports:
         try:
             for proc in psutil.process_iter(['pid', 'name']):
@@ -46,9 +48,10 @@ def kill_processes_by_port(ports: List[int]):
                     for conn in connections:
                         if hasattr(conn, 'laddr') and conn.laddr and conn.laddr.port == port:
                             logger.info(
-                                f"Force killing process {proc.info['name']} (PID: {proc.info['pid']}) on port {port}"
+                                f"🔄 Killing existing process {proc.info['name']} (PID: {proc.info['pid']}) on port {port}"
                             )
                             psutil.Process(proc.info['pid']).terminate()
+                            killed_any = True
                             time.sleep(0.5)
                             try:
                                 psutil.Process(proc.info['pid']).kill()
@@ -58,6 +61,41 @@ def kill_processes_by_port(ports: List[int]):
                     continue
         except Exception as e:
             logger.debug(f"Error killing processes on port {port}: {e}")
+
+    if killed_any:
+        logger.info("✨ Cleaned up existing processes")
+        time.sleep(1)
+
+
+def wait_for_registry_server(port: int, max_retries: int = 30, retry_interval: float = 0.5):
+    """
+    Wait for the registry server to be ready by pinging its health endpoint.
+
+    Args:
+        port: The port number the registry server is running on
+        max_retries: Maximum number of retry attempts (default: 30)
+        retry_interval: Time in seconds between retries (default: 0.5)
+
+    Raises:
+        TimeoutError: If the server doesn't become ready within max_retries attempts
+    """
+    url = f"http://127.0.0.1:{port}/"
+
+    for attempt in range(max_retries):
+        try:
+            with httpx.Client(timeout=1.0) as client:
+                response = client.get(url)
+                if response.status_code == 200:
+                    logger.info("Registry server is ready!")
+                    return
+        except (httpx.ConnectError, httpx.TimeoutException, httpx.RequestError):
+            if attempt < max_retries - 1:
+                time.sleep(retry_interval)
+            else:
+                raise TimeoutError(
+                    f"Registry server did not become ready after {max_retries * retry_interval:.1f} seconds. "
+                    f"Please check if the server started correctly on port {port}."
+                )
 
 
 def kill_process_tree(pid):
@@ -285,11 +323,13 @@ def callback(
     This tool helps you control various components of the Cuga ecosystem:
 
     - demo: Both registry and demo agent (runs directly)
+    - demo_crm: CRM demo with email MCP, mail sink, and CRM API (runs directly)
     - registry: The MCP registry service only (runs directly)
     - appworld: AppWorld environment and API servers (runs directly)
 
     Examples:
       cuga start demo           # Start both registry and demo agent directly
+      cuga start demo_crm       # Start CRM demo with all required services
       cuga start registry       # Start registry only
       cuga start appworld       # Start AppWorld servers
     """
@@ -304,7 +344,7 @@ def callback(
 # Helper function to validate service
 def validate_service(service: str):
     """Validate service name."""
-    valid_services = ["demo", "registry", "appworld"]
+    valid_services = ["demo", "demo_crm", "registry", "appworld"]
 
     if service not in valid_services:
         logger.error(f"Unknown service: {service}. Valid options are: {', '.join(valid_services)}")
@@ -315,7 +355,7 @@ def validate_service(service: str):
 def start(
     service: str = typer.Argument(
         ...,
-        help="Service to start: demo (registry + demo agent), registry (registry only), or appworld (environment + api servers)",
+        help="Service to start: demo (registry + demo agent), demo_crm (CRM demo with email), registry (registry only), or appworld (environment + api servers)",
     ),
     host: str = typer.Option(
         "127.0.0.1",
@@ -333,12 +373,14 @@ def start(
 
     Available services:
       - demo: Starts both registry and demo agent directly (registry on port 8001, demo on port 8005)
+      - demo_crm: Starts CRM demo with email MCP, mail sink, and CRM API servers
       - registry: Starts only the registry service directly (uvicorn on port 8001)
       - appworld: Starts AppWorld environment and API servers (environment on port 8000, api on port 9000)
 
     Examples:
       cuga start demo                # Start with local sandbox (default)
       cuga start demo --sandbox      # Start with remote sandbox (Docker/Podman)
+      cuga start demo_crm            # Start CRM demo with all required services
       cuga start registry            # Start registry only
       cuga start appworld            # Start AppWorld servers
     """
@@ -347,6 +389,10 @@ def start(
     # Handle direct execution services (demo and registry)
     if service == "demo":
         try:
+            # Clean up any existing processes on the ports we need
+            logger.info("🧹 Checking for existing processes on required ports...")
+            kill_processes_by_port([settings.server_ports.registry, settings.server_ports.demo])
+
             # Set environment variable for host
             os.environ["CUGA_HOST"] = host
 
@@ -436,8 +482,158 @@ def start(
             raise typer.Exit(1)
         return
 
+    elif service == "demo_crm":
+        try:
+            # Check if cuga_workspace folder exists
+            workspace_path = os.path.join(os.getcwd(), "cuga_workspace")
+            if not os.path.exists(workspace_path):
+                logger.warning(f"📁 Creating cuga_workspace directory at {workspace_path}")
+                os.makedirs(workspace_path, exist_ok=True)
+                logger.info("✅ cuga_workspace directory created")
+            else:
+                logger.info(f"✅ cuga_workspace directory found at {workspace_path}")
+
+            # Clean up any existing processes on the ports we need
+            logger.info("🧹 Checking for existing processes on required ports...")
+            kill_processes_by_port(
+                [
+                    1025,  # Email sink SMTP
+                    8000,  # Email MCP SSE
+                    8007,  # CRM API
+                    settings.server_ports.registry,
+                    settings.server_ports.demo,
+                ]
+            )
+
+            # Set environment variable for host
+            os.environ["CUGA_HOST"] = host
+
+            # If sandbox mode is enabled, update settings dynamically
+            if sandbox:
+                logger.info(
+                    "Starting CRM demo with remote sandbox mode enabled (features.local_sandbox=false)"
+                )
+                os.environ["DYNACONF_FEATURES__LOCAL_SANDBOX"] = "false"
+            else:
+                pass
+
+            # Start email sink first
+            run_direct_service(
+                "email-sink",
+                ["uvx", "--refresh", "--from", "./docs/examples/demo_apps/email_mcp/mail_sink", "email_sink"],
+            )
+            logger.info("Email sink started")
+            time.sleep(2)
+
+            # Start email MCP server
+            run_direct_service(
+                "email-mcp",
+                ["uvx", "--refresh", "--from", "./docs/examples/demo_apps/email_mcp/mcp_server", "email_mcp"],
+            )
+            logger.info("Email MCP server started")
+            time.sleep(2)
+
+            # Start CRM API server
+            run_direct_service(
+                "crm-api",
+                ["uvx", "--refresh", "--from", "./docs/examples/demo_apps/crm", "crm-api"],
+            )
+            logger.info("CRM API server started")
+            time.sleep(10)
+
+            # Start registry with CRM configuration
+            os.environ["MCP_SERVERS_FILE"] = os.path.join(
+                PACKAGE_ROOT, "backend", "tools_env", "registry", "config", "mcp_servers_crm.yaml"
+            )
+            registry_process = run_direct_service(
+                "registry",
+                [
+                    "uvicorn",
+                    "cuga.backend.tools_env.registry.registry.api_registry_server:app",
+                    "--host",
+                    host,
+                    "--port",
+                    str(settings.server_ports.registry),
+                ],
+            )
+
+            # Check if registry failed to start
+            if registry_process is None or registry_process.poll() is not None:
+                logger.error("Registry service failed to start. Exiting.")
+                stop_direct_processes()
+                raise typer.Exit(1)
+
+            # Wait for registry to be ready
+            logger.info("Waiting for registry to start...")
+            try:
+                wait_for_registry_server(settings.server_ports.registry)
+            except TimeoutError as e:
+                logger.error(str(e))
+                stop_direct_processes()
+                raise typer.Exit(1)
+
+            # Double-check registry is still running after wait
+            if registry_process.poll() is not None:
+                logger.error("Registry service terminated during startup. Exiting.")
+                stop_direct_processes()
+                raise typer.Exit(1)
+
+            # Then start demo
+            demo_command = []
+            if sandbox:
+                demo_command = [
+                    "uv",
+                    "run",
+                    "--group",
+                    "sandbox",
+                    "fastapi",
+                    "dev",
+                    os.path.join(PACKAGE_ROOT, "backend", "server", "main.py"),
+                    "--host",
+                    host,
+                    "--no-reload",
+                    "--port",
+                    str(settings.server_ports.demo),
+                ]
+            else:
+                demo_command = [
+                    "fastapi",
+                    "dev",
+                    os.path.join(PACKAGE_ROOT, "backend", "server", "main.py"),
+                    "--host",
+                    host,
+                    "--no-reload",
+                    "--port",
+                    str(settings.server_ports.demo),
+                ]
+
+            run_direct_service("demo", demo_command)
+
+            if direct_processes:
+                logger.info(
+                    "\n\033[1;36m┌──────────────────────────────────────────────────┐\n"
+                    "\033[1;36m│\033[0m \033[1;33mCRM Demo services are running. Press Ctrl+C to stop\033[0m \033[1;36m│\033[0m\n"
+                    f"\033[1;36m│\033[0m \033[1;37mRegistry: http://localhost:{settings.server_ports.registry}                 \033[0m \033[1;36m│\033[0m\n"
+                    f"\033[1;36m│\033[0m \033[1;37mDemo: http://localhost:{settings.server_ports.demo}                     \033[0m \033[1;36m│\033[0m\n"
+                    "\033[1;36m│\033[0m \033[1;37mCRM API: http://localhost:8007                   \033[0m \033[1;36m│\033[0m\n"
+                    "\033[1;36m│\033[0m \033[1;37mEmail MCP: http://localhost:8000/sse             \033[0m \033[1;36m│\033[0m\n"
+                    "\033[1;36m│\033[0m \033[1;37mEmail Sink: smtp://localhost:1025                \033[0m \033[1;36m│\033[0m\n"
+                    "\033[1;36m└──────────────────────────────────────────────────┘\033[0m"
+                )
+                wait_for_direct_processes()
+
+        except Exception as e:
+            logger.error(f"Error starting CRM demo services: {e}")
+            stop_direct_processes()
+            raise typer.Exit(1)
+        return
+
     elif service == "registry":
         try:
+            # Clean up any existing processes on the port we need
+            logger.info("🧹 Checking for existing processes on required ports...")
+            kill_processes_by_port([settings.server_ports.registry])
+
             run_direct_service(
                 "registry",
                 [
@@ -463,6 +659,10 @@ def start(
 
     elif service == "appworld":
         try:
+            # Clean up any existing processes on the ports we need
+            logger.info("🧹 Checking for existing processes on required ports...")
+            kill_processes_by_port([settings.server_ports.environment_url, settings.server_ports.apis_url])
+
             # Start environment server first
             run_direct_service(
                 "appworld-environment",
@@ -513,6 +713,19 @@ def manage_service(action: str, service: str):
                     del direct_processes[service_name]
             if not stopped_any:
                 logger.info("Demo services are not running")
+        elif service == "demo_crm":
+            # Stop all CRM demo services
+            stopped_any = False
+            for service_name in ["email-sink", "email-mcp", "crm-api", "registry", "demo"]:
+                if service_name in direct_processes:
+                    process = direct_processes[service_name]
+                    if process and process.poll() is None:
+                        logger.info(f"Stopping {service_name}...")
+                        kill_process_tree(process.pid)
+                        stopped_any = True
+                    del direct_processes[service_name]
+            if not stopped_any:
+                logger.info("CRM demo services are not running")
         elif service == "registry":
             # Stop only registry for registry service
             if "registry" in direct_processes:
@@ -548,7 +761,7 @@ def manage_service(action: str, service: str):
 def stop(
     service: str = typer.Argument(
         ...,
-        help="Service to stop: demo (registry + demo agent), registry (registry only), or appworld (environment + api servers)",
+        help="Service to stop: demo (registry + demo agent), demo_crm (CRM demo services), registry (registry only), or appworld (environment + api servers)",
     ),
 ):
     """
@@ -556,11 +769,13 @@ def stop(
 
     Available services:
       - demo: Stops both registry and demo agent (direct processes)
+      - demo_crm: Stops all CRM demo services (email sink, email MCP, CRM API, registry, demo)
       - registry: Stops only the registry service (direct process)
       - appworld: Stops both AppWorld environment and API servers (direct processes)
 
     Examples:
       cuga stop demo       # Stop both registry and demo services
+      cuga stop demo_crm   # Stop all CRM demo services
       cuga stop registry   # Stop only the registry service
       cuga stop appworld   # Stop AppWorld servers
     """
@@ -596,7 +811,7 @@ def viz():
 def status(
     service: str = typer.Argument(
         "all",
-        help="Service to check status: demo (registry + demo agent), registry (registry only), appworld (environment + api servers), or all (all services)",
+        help="Service to check status: demo (registry + demo agent), demo_crm (CRM demo services), registry (registry only), appworld (environment + api servers), or all (all services)",
     ),
 ):
     """
@@ -604,6 +819,7 @@ def status(
 
     Available services:
       - demo: Shows status of both registry and demo agent (direct processes)
+      - demo_crm: Shows status of all CRM demo services (email sink, email MCP, CRM API, registry, demo)
       - registry: Shows status of registry service only (direct process)
       - appworld: Shows status of both AppWorld environment and API servers (direct processes)
       - all: Shows status of all services (default)
@@ -611,6 +827,7 @@ def status(
     Examples:
       cuga status              # Show status of all services
       cuga status demo         # Show status of demo services (registry + demo)
+      cuga status demo_crm     # Show status of CRM demo services
       cuga status registry     # Show status of registry only
       cuga status appworld     # Show status of AppWorld servers
     """
@@ -625,6 +842,19 @@ def status(
                     logger.info(f"{service_name.capitalize()} service: Terminated")
             else:
                 logger.info(f"{service_name.capitalize()} service: Not running")
+        return
+
+    elif service == "demo_crm":
+        # Show status of all CRM demo services
+        for service_name in ["email-sink", "email-mcp", "crm-api", "registry", "demo"]:
+            if service_name in direct_processes:
+                process = direct_processes[service_name]
+                if process.poll() is None:
+                    logger.info(f"{service_name} service: Running (PID: {process.pid})")
+                else:
+                    logger.info(f"{service_name} service: Terminated")
+            else:
+                logger.info(f"{service_name} service: Not running")
         return
 
     elif service == "registry":
@@ -656,7 +886,15 @@ def status(
     elif service == "all":
         # Show direct processes status
         logger.info("Services:")
-        for service_name in ["demo", "registry", "appworld-environment", "appworld-api"]:
+        for service_name in [
+            "demo",
+            "registry",
+            "email-sink",
+            "email-mcp",
+            "crm-api",
+            "appworld-environment",
+            "appworld-api",
+        ]:
             if service_name in direct_processes:
                 process = direct_processes[service_name]
                 if process.poll() is None:
@@ -752,7 +990,7 @@ def evaluate(
             )
             # Wait for registry to start
             logger.info("Waiting for registry to start...")
-            time.sleep(7)
+            wait_for_registry_server(settings.server_ports.registry)
 
             # Then start demo - using explicit fastapi command
             run_direct_service(
